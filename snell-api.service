@@ -1,0 +1,13 @@
+[Unit]
+Description=Snell Manager API
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/workspace/snell-manage
+ExecStart=uvicorn api:app --host 0.0.0.0 --port 2086
+Restart=on-failure
+RestartSec=3s
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,345 @@
+#!/bin/bash
+
+set -euo pipefail
+
+BINARY_URL="https://dl.nssurge.com/snell/snell-server-v5.0.1-linux-amd64.zip"
+BINARY_PATH="/usr/local/bin/snell-server"
+CONFIG_DIR="/etc/snell/users"
+SERVICE_TEMPLATE="/etc/systemd/system/snell@.service"
+PORT_START=8388
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
+
+die()  { echo -e "${RED}Error: $1${NC}" >&2; exit 1; }
+info() { echo -e "${BLUE}$1${NC}"; }
+ok()   { echo -e "${GREEN}$1${NC}"; }
+warn() { echo -e "${YELLOW}$1${NC}"; }
+
+check_root() {
+    [[ $EUID -eq 0 ]] || die "This script must be run as root"
+}
+
+next_port() {
+    local port=$PORT_START
+    while true; do
+        local in_use=false
+        shopt -s nullglob
+        local confs=("$CONFIG_DIR"/*.conf)
+        shopt -u nullglob
+        for conf in "${confs[@]}"; do
+            grep -q "listen = 0.0.0.0:$port" "$conf" && in_use=true && break
+        done
+        $in_use || { echo "$port"; return; }
+        ((port++))
+    done
+}
+
+get_server_ip() {
+    curl -fsSL --connect-timeout 5 https://api4.ipify.org 2>/dev/null || echo "YOUR_SERVER_IP"
+}
+
+surge_line() {
+    local username="$1" port="$2" psk="$3"
+    local ip
+    ip=$(get_server_ip)
+    echo "$username = snell, $ip, $port, psk=$psk, version=5"
+}
+
+# ── install ──────────────────────────────────────────────────────────────────
+
+cmd_install() {
+    check_root
+    info "Downloading snell-server from $BINARY_URL ..."
+
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    trap "rm -rf $tmp_dir" EXIT
+
+    curl -fL "$BINARY_URL" -o "$tmp_dir/snell.zip"
+    unzip -q "$tmp_dir/snell.zip" -d "$tmp_dir"
+    install -m 755 "$tmp_dir/snell-server" "$BINARY_PATH"
+
+    mkdir -p "$CONFIG_DIR"
+
+    cat > "$SERVICE_TEMPLATE" << 'EOF'
+[Unit]
+Description=Snell Proxy Server (%i)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/snell-server -c /etc/snell/users/%i.conf
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    ok "snell-server installed to $BINARY_PATH"
+}
+
+# ── add ───────────────────────────────────────────────────────────────────────
+
+cmd_add() {
+    check_root
+    local username="${1:-}"
+    local port="${2:-}"
+
+    [[ -n "$username" ]] || die "Usage: snell-manage add <username> [port]"
+    [[ "$username" =~ ^[a-zA-Z0-9_-]+$ ]] || die "Username may only contain letters, numbers, _ and -"
+    [[ -f "$CONFIG_DIR/$username.conf" ]] && die "User '$username' already exists"
+    [[ -x "$BINARY_PATH" ]] || die "snell-server not installed. Run: snell-manage install"
+
+    if [[ -z "$port" ]]; then
+        port=$(next_port)
+    else
+        [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || die "Invalid port: $port"
+        shopt -s nullglob
+        local existing_confs=("$CONFIG_DIR"/*.conf)
+        shopt -u nullglob
+        for conf in "${existing_confs[@]}"; do
+            grep -q "listen = 0.0.0.0:$port" "$conf" && die "Port $port is already used by another user"
+        done
+    fi
+
+    local psk
+    psk=$(openssl rand -base64 24)
+
+    mkdir -p "$CONFIG_DIR"
+    cat > "$CONFIG_DIR/$username.conf" << EOF
+[snell-server]
+listen = 0.0.0.0:$port
+psk = $psk
+obfs = off
+EOF
+
+    systemctl enable --now "snell@$username"
+
+    ok "User '$username' created"
+    echo ""
+    printf "  %-6s %s\n" "Port:" "$port"
+    printf "  %-6s %s\n" "PSK:" "$psk"
+    echo ""
+    info "Surge proxy line:"
+    surge_line "$username" "$port" "$psk"
+}
+
+# ── delete ────────────────────────────────────────────────────────────────────
+
+cmd_delete() {
+    check_root
+    local username="${1:-}"
+    [[ -n "$username" ]] || die "Usage: snell-manage delete <username>"
+    [[ -f "$CONFIG_DIR/$username.conf" ]] || die "User '$username' does not exist"
+
+    systemctl disable --now "snell@$username" 2>/dev/null || true
+    rm -f "$CONFIG_DIR/$username.conf"
+    ok "User '$username' deleted"
+}
+
+# ── list ──────────────────────────────────────────────────────────────────────
+
+cmd_list() {
+    check_root
+    shopt -s nullglob
+    local confs=("$CONFIG_DIR"/*.conf)
+    shopt -u nullglob
+
+    if [[ ${#confs[@]} -eq 0 ]]; then
+        warn "No users found. Use 'snell-manage add <username>' to add one."
+        return
+    fi
+
+    printf "%-20s %-6s %-36s %s\n" "USERNAME" "PORT" "PSK" "STATUS"
+    printf '%0.s─' {1..72}; echo
+
+    for conf in "${confs[@]}"; do
+        local username port psk status color
+        username=$(basename "$conf" .conf)
+        port=$(grep "^listen" "$conf" | grep -oP ':\K\d+')
+        psk=$(grep "^psk" "$conf" | awk '{print $3}')
+
+        if systemctl is-active --quiet "snell@$username" 2>/dev/null; then
+            status="running"; color=$GREEN
+        else
+            status="stopped"; color=$RED
+        fi
+
+        printf "%-20s %-6s %-36s " "$username" "$port" "$psk"
+        echo -e "${color}${status}${NC}"
+    done
+}
+
+# ── start / stop / restart ────────────────────────────────────────────────────
+
+cmd_start() {
+    check_root
+    local username="${1:-}"
+    [[ -n "$username" ]] || die "Usage: snell-manage start <username>"
+    [[ -f "$CONFIG_DIR/$username.conf" ]] || die "User '$username' does not exist"
+    systemctl start "snell@$username"
+    ok "Started snell@$username"
+}
+
+cmd_stop() {
+    check_root
+    local username="${1:-}"
+    [[ -n "$username" ]] || die "Usage: snell-manage stop <username>"
+    [[ -f "$CONFIG_DIR/$username.conf" ]] || die "User '$username' does not exist"
+    systemctl stop "snell@$username"
+    ok "Stopped snell@$username"
+}
+
+cmd_restart() {
+    check_root
+    local username="${1:-}"
+    [[ -n "$username" ]] || die "Usage: snell-manage restart <username>"
+    [[ -f "$CONFIG_DIR/$username.conf" ]] || die "User '$username' does not exist"
+    systemctl restart "snell@$username"
+    ok "Restarted snell@$username"
+}
+
+# ── surge ─────────────────────────────────────────────────────────────────────
+
+cmd_surge() {
+    local username="${1:-}"
+
+    if [[ -z "$username" ]]; then
+        shopt -s nullglob
+        local confs=("$CONFIG_DIR"/*.conf)
+        shopt -u nullglob
+        [[ ${#confs[@]} -gt 0 ]] || { warn "No users found."; return; }
+        local ip
+        ip=$(get_server_ip)
+        for conf in "${confs[@]}"; do
+            local u p psk
+            u=$(basename "$conf" .conf)
+            p=$(grep "^listen" "$conf" | grep -oP ':\K\d+')
+            psk=$(grep "^psk" "$conf" | awk '{print $3}')
+            echo "$u = snell, $ip, $p, psk=$psk, version=5"
+        done
+    else
+        [[ -f "$CONFIG_DIR/$username.conf" ]] || die "User '$username' does not exist"
+        local port psk
+        port=$(grep "^listen" "$CONFIG_DIR/$username.conf" | grep -oP ':\K\d+')
+        psk=$(grep "^psk" "$CONFIG_DIR/$username.conf" | awk '{print $3}')
+        surge_line "$username" "$port" "$psk"
+    fi
+}
+
+# ── keygen ────────────────────────────────────────────────────────────────────
+
+TOKEN_FILE="/etc/snell/api_token"
+PREFIX_FILE="/etc/snell/api_prefix"
+
+cmd_keygen() {
+    check_root
+    mkdir -p /etc/snell
+
+    local token prefix
+    token=$(openssl rand -hex 32)
+    prefix=$(openssl rand -hex 8)   # 16-char hex path segment
+
+    echo "$token"  > "$TOKEN_FILE";  chmod 600 "$TOKEN_FILE"
+    echo "$prefix" > "$PREFIX_FILE"; chmod 600 "$PREFIX_FILE"
+
+    ok "API credentials generated"
+    echo ""
+    printf "  %-10s %s\n" "Prefix:"  "$prefix"
+    printf "  %-10s %s\n" "Token:"   "$token"
+    echo ""
+    _print_api_info "$prefix" "$token"
+    warn "Restart snell-api to apply the new prefix: systemctl restart snell-api"
+}
+
+cmd_keyshow() {
+    check_root
+    [[ -f "$TOKEN_FILE" ]]  || die "No credentials found. Run: snell-manage keygen"
+    [[ -f "$PREFIX_FILE" ]] || die "No prefix found. Run: snell-manage keygen"
+    local prefix token
+    prefix=$(cat "$PREFIX_FILE")
+    token=$(cat "$TOKEN_FILE")
+    echo ""
+    printf "  %-10s %s\n" "Prefix:"  "$prefix"
+    printf "  %-10s %s\n" "Token:"   "$token"
+    echo ""
+    _print_api_info "$prefix" "$token"
+}
+
+_print_api_info() {
+    local prefix="$1" token="$2"
+    local port=2086
+    local ip
+    ip=$(curl -fsSL --connect-timeout 3 https://api4.ipify.org 2>/dev/null || echo "<server-ip>")
+    info "Base URL:    http://$ip:$port/$prefix"
+    info "Swagger UI:  http://$ip:$port/$prefix/docs"
+    info "Auth header: Authorization: Bearer $token"
+}
+
+# ── api-install ───────────────────────────────────────────────────────────────
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+cmd_api_install() {
+    check_root
+    info "Installing Python dependencies..."
+    pip install -q -r "$SCRIPT_DIR/requirements.txt"
+
+    local service_src="$SCRIPT_DIR/snell-api.service"
+    [[ -f "$service_src" ]] || die "snell-api.service not found in $SCRIPT_DIR"
+
+    sed "s|WorkingDirectory=.*|WorkingDirectory=$SCRIPT_DIR|" "$service_src" \
+        > /etc/systemd/system/snell-api.service
+
+    systemctl daemon-reload
+    systemctl enable --now snell-api
+
+    ok "snell-api service installed and started"
+    echo ""
+    if [[ -f "$TOKEN_FILE" && -f "$PREFIX_FILE" ]]; then
+        cmd_keyshow
+    else
+        warn "No credentials yet — run: snell-manage keygen"
+    fi
+}
+
+# ── usage / dispatch ──────────────────────────────────────────────────────────
+
+usage() {
+    cat << EOF
+Usage: snell-manage <command> [args]
+
+Snell instance commands:
+  install              Download and install snell-server binary
+  add <user> [port]    Add a new user (port auto-assigned if omitted)
+  delete <user>        Stop and remove a user
+  list                 List all users with port, PSK, and status
+  start <user>         Start a user's snell instance
+  stop <user>          Stop a user's snell instance
+  restart <user>       Restart a user's snell instance
+  surge [user]         Print Surge proxy line(s) for all or one user
+
+API commands:
+  keygen               Generate (or rotate) URL prefix + Bearer token
+  keyshow              Print current prefix, token, and access URLs
+  api-install          Install Python deps and start snell-api systemd service
+EOF
+}
+
+case "${1:-}" in
+    install)     cmd_install ;;
+    add)         cmd_add     "${2:-}" "${3:-}" ;;
+    delete)      cmd_delete  "${2:-}" ;;
+    list)        cmd_list ;;
+    start)       cmd_start   "${2:-}" ;;
+    stop)        cmd_stop    "${2:-}" ;;
+    restart)     cmd_restart "${2:-}" ;;
+    surge)       cmd_surge   "${2:-}" ;;
+    keygen)      cmd_keygen ;;
+    keyshow)     cmd_keyshow ;;
+    api-install) cmd_api_install ;;
+    *)           usage ;;
+esac
