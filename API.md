@@ -191,6 +191,96 @@ Surge proxy line for one user.
 { "username": "alice", "line": "alice = snell, 1.2.3.4, 8388, psk=abc123, version=5" }
 ```
 
+### Quota
+
+#### `GET /<prefix>/quota`
+List quota for all users.
+
+**Response `200`**
+```json
+[
+  {
+    "username": "alice",
+    "limit": 107374182400,
+    "limit_human": "100.0 GB",
+    "used": 53687091200,
+    "used_human": "50.0 GB",
+    "plan": "monthly",
+    "expire": "2026-05-02",
+    "next_reset": "2026-05-02",
+    "blocked": false,
+    "block_reason": null
+  }
+]
+```
+
+---
+
+#### `GET /<prefix>/quota/{username}`
+Get quota for a single user.
+
+**Response `200`** — same schema as above.
+
+**Errors**
+
+| Code | Reason |
+|------|--------|
+| 404  | No quota set for this user |
+
+---
+
+#### `POST /<prefix>/quota/{username}`
+Set or update quota. Accepts human-readable sizes: `100GB`, `50G`, `1TB`, `512MB`.
+
+**Request body**
+```json
+{
+  "limit": "100GB",
+  "plan": "monthly"
+}
+```
+
+`plan` ∈ `monthly` | `quarterly` | `yearly`
+
+**Response `201`** — quota object.
+
+**Errors**
+
+| Code | Reason |
+|------|--------|
+| 400  | Invalid plan value |
+| 404  | User does not exist |
+
+---
+
+#### `DELETE /<prefix>/quota/{username}`
+Remove quota limit (user becomes unlimited).
+
+**Response `204` No Content**
+
+---
+
+#### `POST /<prefix>/quota/{username}/reset`
+Reset this month's usage counter to 0 and unblock user (if blocked by quota).
+
+**Response `200`** — updated quota object.
+
+---
+
+#### `POST /<prefix>/quota/{username}/renew`
+Renew subscription. Extends `expire` by one plan period from today.
+
+**Request body** (all fields optional)
+```json
+{
+  "plan": "yearly"
+}
+```
+
+Omit `plan` to renew using the existing plan.
+
+**Response `200`** — updated quota object.
+
 ---
 
 ## curl examples
@@ -220,4 +310,38 @@ curl -s -X DELETE -H "$AUTH" $BASE/users/alice
 
 # Get all Surge lines
 curl -s -H "$AUTH" $BASE/surge | jq -r '.[].line'
+
+# ── Quota ──────────────────────────────────────────────────────────────────────
+
+# Set quota: 100GB/month, monthly plan
+curl -s -X POST -H "$AUTH" -H "Content-Type: application/json" \
+  -d '{"limit":"100GB","plan":"monthly"}' $BASE/quota/alice | jq
+
+# Set quota: 100GB/month, quarterly plan
+curl -s -X POST -H "$AUTH" -H "Content-Type: application/json" \
+  -d '{"limit":"100GB","plan":"quarterly"}' $BASE/quota/alice | jq
+
+# Set quota: 100GB/month, yearly plan
+curl -s -X POST -H "$AUTH" -H "Content-Type: application/json" \
+  -d '{"limit":"100GB","plan":"yearly"}' $BASE/quota/alice | jq
+
+# View quota for one user
+curl -s -H "$AUTH" $BASE/quota/alice | jq
+
+# View quota for all users
+curl -s -H "$AUTH" $BASE/quota | jq
+
+# Reset this month's usage (unblocks user)
+curl -s -X POST -H "$AUTH" $BASE/quota/alice/reset | jq
+
+# Renew subscription (same plan)
+curl -s -X POST -H "$AUTH" -H "Content-Type: application/json" \
+  -d '{}' $BASE/quota/alice/renew | jq
+
+# Renew and upgrade plan
+curl -s -X POST -H "$AUTH" -H "Content-Type: application/json" \
+  -d '{"plan":"yearly"}' $BASE/quota/alice/renew | jq
+
+# Remove quota limit
+curl -s -X DELETE -H "$AUTH" $BASE/quota/alice
 ```

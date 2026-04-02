@@ -285,6 +285,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 cmd_api_install() {
     check_root
+    info "Installing snell-manage to /usr/local/bin..."
+    cp "$SCRIPT_DIR/snell-manage" /usr/local/bin/snell-manage
+    chmod +x /usr/local/bin/snell-manage
+
     info "Installing Python dependencies..."
     pip install -q -r "$SCRIPT_DIR/requirements.txt"
 
@@ -304,6 +308,433 @@ cmd_api_install() {
     else
         warn "No credentials yet — run: snell-manage keygen"
     fi
+}
+
+# ── quota ─────────────────────────────────────────────────────────────────────
+
+QUOTA_DIR="/etc/snell/quota"
+
+# Parse human-readable size to bytes: 100GB → 107374182400
+_parse_size() {
+    local input="${1^^}"        # uppercase
+    input="${input%B}"          # strip trailing B: GB→G, TB→T …
+    local num unit
+    if [[ "$input" =~ ^([0-9]+)([TGMK]?)$ ]]; then
+        num="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[2]}"
+    else
+        die "Invalid size: $1  (examples: 100GB  50G  1TB  512MB)"
+    fi
+    case "$unit" in
+        T) echo $(( num * 1099511627776 )) ;;
+        G) echo $(( num * 1073741824 ))    ;;
+        M) echo $(( num * 1048576 ))       ;;
+        K) echo $(( num * 1024 ))          ;;
+        *) echo "$num" ;;
+    esac
+}
+
+# Format unix timestamp to YYYY-MM-DD (0 → —)
+_fmt_date() {
+    local ts="${1:-0}"
+    (( ts > 0 )) && date -d "@$ts" "+%Y-%m-%d" || echo "—"
+}
+
+# Compute next reset timestamp from a period string
+_next_reset_ts() {
+    case "$1" in
+        monthly)   date -d "+1 month"  +%s ;;
+        quarterly) date -d "+3 months" +%s ;;
+        yearly)    date -d "+1 year"   +%s ;;
+        *)         echo "0" ;;
+    esac
+}
+
+# Format bytes to human-readable string
+_fmt_bytes() {
+    local b="${1:-0}"
+    (( b == 0 )) && { echo "0 B"; return; }
+    if   (( b >= 1099511627776 )); then awk "BEGIN{printf \"%.2f TB\", $b/1099511627776}"
+    elif (( b >= 1073741824    )); then awk "BEGIN{printf \"%.2f GB\", $b/1073741824}"
+    elif (( b >= 1048576       )); then awk "BEGIN{printf \"%.2f MB\", $b/1048576}"
+    elif (( b >= 1024          )); then awk "BEGIN{printf \"%.2f KB\", $b/1024}"
+    else echo "${b} B"
+    fi
+}
+
+# Quota file helpers
+_qget() { grep "^$2=" "$QUOTA_DIR/$1" 2>/dev/null | cut -d= -f2 || echo "0"; }
+_qset() {
+    local f="$QUOTA_DIR/$1"
+    if grep -q "^$2=" "$f" 2>/dev/null; then sed -i "s|^$2=.*|$2=$3|" "$f"
+    else echo "$2=$3" >> "$f"; fi
+}
+
+# Get snell port for a user
+_user_port() {
+    local conf="$CONFIG_DIR/$1.conf"
+    [[ -f "$conf" ]] || return 1
+    grep "^listen" "$conf" | grep -oP ':\K\d+'
+}
+
+# Ensure SNELL_ACCT chain is wired into INPUT + OUTPUT
+_ensure_chain() {
+    iptables -N SNELL_ACCT 2>/dev/null || true
+    iptables -C INPUT  -j SNELL_ACCT 2>/dev/null || iptables -I INPUT  -j SNELL_ACCT
+    iptables -C OUTPUT -j SNELL_ACCT 2>/dev/null || iptables -I OUTPUT -j SNELL_ACCT
+}
+
+# Add per-user counting rules (idempotent)
+_acct_add() {
+    local u="$1" port="$2"
+    _ensure_chain
+    iptables -C SNELL_ACCT -p tcp --dport "$port" -m comment --comment "snell-in:$u"  -j RETURN 2>/dev/null \
+        || iptables -A SNELL_ACCT -p tcp --dport "$port" -m comment --comment "snell-in:$u"  -j RETURN
+    iptables -C SNELL_ACCT -p tcp --sport "$port" -m comment --comment "snell-out:$u" -j RETURN 2>/dev/null \
+        || iptables -A SNELL_ACCT -p tcp --sport "$port" -m comment --comment "snell-out:$u" -j RETURN
+}
+
+# Remove all iptables rules for a user (counting + drop)
+_acct_rm() {
+    local u="$1" port="$2"
+    iptables -D SNELL_ACCT -p tcp --dport "$port" -m comment --comment "snell-in:$u"      -j RETURN 2>/dev/null || true
+    iptables -D SNELL_ACCT -p tcp --sport "$port" -m comment --comment "snell-out:$u"     -j RETURN 2>/dev/null || true
+    iptables -D SNELL_ACCT -p tcp --dport "$port" -m comment --comment "snell-drop-in:$u" -j DROP   2>/dev/null || true
+    iptables -D SNELL_ACCT -p tcp --sport "$port" -m comment --comment "snell-drop-out:$u"-j DROP   2>/dev/null || true
+}
+
+# Read current byte counter for a comment tag
+_acct_bytes() {
+    iptables -nvxL SNELL_ACCT 2>/dev/null | awk -v c="$1" '$0 ~ c {print $2; exit}' || echo "0"
+}
+
+# Block a user: add DROP rules + stop service
+_block_user() {
+    local u="$1" port="$2"
+    iptables -C SNELL_ACCT -p tcp --dport "$port" -m comment --comment "snell-drop-in:$u"  -j DROP 2>/dev/null \
+        || iptables -I SNELL_ACCT -p tcp --dport "$port" -m comment --comment "snell-drop-in:$u"  -j DROP
+    iptables -C SNELL_ACCT -p tcp --sport "$port" -m comment --comment "snell-drop-out:$u" -j DROP 2>/dev/null \
+        || iptables -I SNELL_ACCT -p tcp --sport "$port" -m comment --comment "snell-drop-out:$u" -j DROP
+    systemctl stop "snell@$u" 2>/dev/null || true
+}
+
+# Unblock a user: remove DROP rules + start service
+_unblock_user() {
+    local u="$1" port="$2"
+    iptables -D SNELL_ACCT -p tcp --dport "$port" -m comment --comment "snell-drop-in:$u"  -j DROP 2>/dev/null || true
+    iptables -D SNELL_ACCT -p tcp --sport "$port" -m comment --comment "snell-drop-out:$u" -j DROP 2>/dev/null || true
+    systemctl start "snell@$u" 2>/dev/null || true
+}
+
+# Compute expiry timestamp from a plan name
+_expiry_from_plan() {
+    case "$1" in
+        monthly)   date -d "+1 month"  +%s ;;
+        quarterly) date -d "+3 months" +%s ;;
+        yearly)    date -d "+1 year"   +%s ;;
+        *) die "plan must be: monthly  quarterly  yearly" ;;
+    esac
+}
+
+cmd_quota() {
+    check_root
+    case "${2:-}" in
+        set)     _quota_set_cmd    "${3:-}" "${4:-}" "${5:-}" ;;
+        renew)   _quota_renew_cmd  "${3:-}" "${4:-}" ;;
+        show)    _quota_show_cmd   "${3:-}" ;;
+        reset)   _quota_reset_cmd  "${3:-}" ;;
+        rm)      _quota_rm_cmd     "${3:-}" ;;
+        sync)    _quota_sync_cmd ;;
+        install) _quota_install_cmd ;;
+        *)
+            cat << 'EOF'
+Usage: snell-manage quota <subcommand>
+
+  set <user> <limit/mo> <plan>   Create quota: monthly limit + subscription plan
+                                 limit : 100GB  50G  1TB  512MB
+                                 plan  : monthly  quarterly  yearly
+  renew <user> [plan]            Extend subscription (keeps current plan if omitted)
+  show [user]                    Show usage + expiry table
+  reset <user>                   Manually reset this month's traffic counter
+  rm <user>                      Remove quota tracking for user
+  sync                           Collect iptables counters (run by timer)
+  install                        Install systemd timer (auto-sync every 60 s)
+EOF
+        ;;
+    esac
+}
+
+_quota_set_cmd() {
+    local username="${1:-}" size="${2:-}" plan="${3:-}"
+    [[ -n "$username" && -n "$size" && -n "$plan" ]] \
+        || die "Usage: snell-manage quota set <user> <limit/mo> <monthly|quarterly|yearly>"
+    [[ -f "$CONFIG_DIR/$username.conf" ]] || die "User '$username' does not exist"
+    [[ "$plan" =~ ^(monthly|quarterly|yearly)$ ]] \
+        || die "plan must be: monthly  quarterly  yearly"
+
+    local limit port expire next_reset
+    limit=$(_parse_size "$size")
+    port=$(_user_port "$username")
+    expire=$(_expiry_from_plan "$plan")
+    next_reset=$(date -d "+1 month" +%s)
+
+    mkdir -p "$QUOTA_DIR"
+    printf "limit=%s\nused=0\nblocked=0\nblock_reason=\nlast_in=0\nlast_out=0\nplan=%s\nexpire=%s\nnext_reset=%s\n" \
+        "$limit" "$plan" "$expire" "$next_reset" > "$QUOTA_DIR/$username"
+
+    _acct_add "$username" "$port"
+
+    ok "Quota set: $username"
+    printf "  %-14s %s / month\n" "Traffic:"  "$(_fmt_bytes "$limit")"
+    printf "  %-14s %s\n"         "Plan:"     "$plan"
+    printf "  %-14s %s\n"         "Expires:"  "$(_fmt_date "$expire")"
+    printf "  %-14s %s\n"         "Next reset:" "$(_fmt_date "$next_reset")"
+}
+
+_quota_renew_cmd() {
+    local username="${1:-}" plan="${2:-}"
+    [[ -n "$username" ]] || die "Usage: snell-manage quota renew <user> [plan]"
+    [[ -f "$QUOTA_DIR/$username" ]] || die "No quota set for '$username'"
+
+    # Default to existing plan
+    local current_plan
+    current_plan=$(grep "^plan=" "$QUOTA_DIR/$username" | cut -d= -f2)
+    plan="${plan:-$current_plan}"
+    [[ "$plan" =~ ^(monthly|quarterly|yearly)$ ]] \
+        || die "plan must be: monthly  quarterly  yearly"
+
+    # Extend from current expiry if still in future, otherwise from now
+    local now current_expire base new_expire
+    now=$(date +%s)
+    current_expire=$(_qget "$username" expire)
+    (( current_expire > now )) && base=$current_expire || base=$now
+
+    case "$plan" in
+        monthly)   new_expire=$(date -d "@${base} +1 month"  +%s) ;;
+        quarterly) new_expire=$(date -d "@${base} +3 months" +%s) ;;
+        yearly)    new_expire=$(date -d "@${base} +1 year"   +%s) ;;
+    esac
+
+    _qset "$username" plan   "$plan"
+    _qset "$username" expire "$new_expire"
+
+    # Unblock if expired
+    local reason
+    reason=$(grep "^block_reason=" "$QUOTA_DIR/$username" 2>/dev/null | cut -d= -f2 || echo "")
+    if [[ "$reason" == "expired" ]]; then
+        local port
+        port=$(_user_port "$username")
+        _qset "$username" blocked "0"
+        _qset "$username" block_reason ""
+        _unblock_user "$username" "$port"
+    fi
+
+    ok "Renewed: $username"
+    printf "  %-14s %s\n" "Plan:"    "$plan"
+    printf "  %-14s %s\n" "Expires:" "$(_fmt_date "$new_expire")"
+}
+
+_quota_show_cmd() {
+    local target="${1:-}"
+    mkdir -p "$QUOTA_DIR"
+    shopt -s nullglob; local qfiles=("$QUOTA_DIR"/*); shopt -u nullglob
+
+    if [[ -n "$target" ]]; then
+        [[ -f "$QUOTA_DIR/$target" ]] || die "No quota set for '$target'"
+        qfiles=("$QUOTA_DIR/$target")
+    fi
+
+    if [[ ${#qfiles[@]} -eq 0 ]]; then
+        warn "No quotas configured. Use: snell-manage quota set <user> <limit> <plan>"; return
+    fi
+
+    printf "%-16s %-10s %-10s %-8s %-11s %-12s %-12s %s\n" \
+        "USER" "LIMIT/mo" "USED" "%" "PLAN" "NEXT RESET" "EXPIRES" "STATUS"
+    printf '%0.s─' {1..95}; echo
+
+    local now
+    now=$(date +%s)
+
+    for qfile in "${qfiles[@]}"; do
+        local u limit used blocked plan expire next_reset block_reason remain pct status color
+        u=$(basename "$qfile")
+        limit=$(_qget "$u" limit)
+        used=$(_qget "$u" used)
+        blocked=$(_qget "$u" blocked)
+        plan=$(grep "^plan=" "$QUOTA_DIR/$u" 2>/dev/null | cut -d= -f2 || echo "—")
+        expire=$(_qget "$u" expire)
+        next_reset=$(_qget "$u" next_reset)
+        block_reason=$(grep "^block_reason=" "$QUOTA_DIR/$u" 2>/dev/null | cut -d= -f2 || echo "")
+        pct=$(awk "BEGIN{printf \"%.1f\", ($limit>0 ? $used/$limit*100 : 0)}")
+
+        if [[ "$blocked" == "1" && "$block_reason" == "expired" ]]; then
+            status="expired"; color=$YELLOW
+        elif [[ "$blocked" == "1" ]]; then
+            status="quota"; color=$RED
+        elif (( expire > 0 && expire - now < 604800 )); then   # < 7 days left
+            status="expiring"; color=$YELLOW
+        else
+            status="active"; color=$GREEN
+        fi
+
+        printf "%-16s %-10s %-10s %-8s %-11s %-12s %-12s " \
+            "$u" "$(_fmt_bytes "$limit")" "$(_fmt_bytes "$used")" "${pct}%" \
+            "$plan" "$(_fmt_date "$next_reset")" "$(_fmt_date "$expire")"
+        echo -e "${color}${status}${NC}"
+    done
+}
+
+_quota_reset_cmd() {
+    local username="${1:-}"
+    [[ -n "$username" ]] || die "Usage: snell-manage quota reset <user>"
+    [[ -f "$QUOTA_DIR/$username" ]] || die "No quota set for '$username'"
+
+    local port
+    port=$(_user_port "$username")
+
+    _qset "$username" used         "0"
+    _qset "$username" blocked      "0"
+    _qset "$username" block_reason ""
+    _qset "$username" last_in      "0"
+    _qset "$username" last_out     "0"
+    _qset "$username" next_reset   "$(date -d '+1 month' +%s)"
+
+    _acct_rm "$username" "$port"
+    _acct_add "$username" "$port"
+    _unblock_user "$username" "$port"
+
+    ok "Traffic reset for '$username' (next reset: $(_fmt_date "$(date -d '+1 month' +%s)"))"
+}
+
+_quota_rm_cmd() {
+    local username="${1:-}"
+    [[ -n "$username" ]] || die "Usage: snell-manage quota rm <user>"
+    [[ -f "$QUOTA_DIR/$username" ]] || die "No quota set for '$username'"
+
+    local port
+    port=$(_user_port "$username" 2>/dev/null || echo "")
+    [[ -n "$port" ]] && _acct_rm "$username" "$port"
+
+    rm -f "$QUOTA_DIR/$username"
+    ok "Quota removed for '$username'"
+}
+
+_quota_sync_cmd() {
+    shopt -s nullglob; local qfiles=("$QUOTA_DIR"/*); shopt -u nullglob
+    [[ ${#qfiles[@]} -eq 0 ]] && return
+
+    _ensure_chain
+
+    local now
+    now=$(date +%s)
+
+    for qfile in "${qfiles[@]}"; do
+        local u limit used blocked last_in last_out port expire next_reset block_reason
+        local cur_in cur_out delta new_used
+        u=$(basename "$qfile")
+        limit=$(_qget "$u" limit)
+        used=$(_qget "$u" used)
+        blocked=$(_qget "$u" blocked)
+        last_in=$(_qget "$u" last_in)
+        last_out=$(_qget "$u" last_out)
+        expire=$(_qget "$u" expire)
+        next_reset=$(_qget "$u" next_reset)
+        block_reason=$(grep "^block_reason=" "$QUOTA_DIR/$u" 2>/dev/null | cut -d= -f2 || echo "")
+
+        port=$(_user_port "$u" 2>/dev/null) || continue
+
+        # ── 1. Check account expiry ───────────────────────────────────────────
+        if (( expire > 0 && now >= expire )); then
+            if [[ "$block_reason" != "expired" ]]; then
+                _qset "$u" blocked "1"
+                _qset "$u" block_reason "expired"
+                _block_user "$u" "$port"
+                warn "[$u] account expired ($(_fmt_date "$expire")) — blocked"
+            else
+                _acct_add "$u" "$port"   # re-apply after reboot
+                _block_user "$u" "$port"
+            fi
+            continue
+        fi
+
+        # ── 2. Monthly traffic reset ──────────────────────────────────────────
+        if (( next_reset > 0 && now >= next_reset )); then
+            _acct_rm "$u" "$port"
+            _acct_add "$u" "$port"
+
+            # Unblock quota-blocked users on new month
+            if [[ "$blocked" == "1" && "$block_reason" == "quota" ]]; then
+                _unblock_user "$u" "$port"
+                blocked=0; block_reason=""
+            fi
+
+            local new_next
+            new_next=$(date -d "+1 month" +%s)
+            _qset "$u" used         "0"
+            _qset "$u" blocked      "$blocked"
+            _qset "$u" block_reason "$block_reason"
+            _qset "$u" last_in      "0"
+            _qset "$u" last_out     "0"
+            _qset "$u" next_reset   "$new_next"
+
+            used=0; last_in=0; last_out=0
+            info "[$u] monthly traffic reset — next: $(_fmt_date "$new_next")"
+        fi
+
+        # ── 3. Re-create iptables rules after reboot ──────────────────────────
+        _acct_add "$u" "$port"
+        [[ "$blocked" == "1" ]] && _block_user "$u" "$port"
+
+        # ── 4. Collect traffic delta ──────────────────────────────────────────
+        cur_in=$(_acct_bytes "snell-in:$u")
+        cur_out=$(_acct_bytes "snell-out:$u")
+
+        delta=$(( (cur_in  >= last_in  ? cur_in  - last_in  : cur_in)
+                + (cur_out >= last_out ? cur_out - last_out : cur_out) ))
+
+        new_used=$(( used + delta ))
+        _qset "$u" used     "$new_used"
+        _qset "$u" last_in  "$cur_in"
+        _qset "$u" last_out "$cur_out"
+
+        # ── 5. Enforce monthly quota ──────────────────────────────────────────
+        if [[ "$blocked" != "1" ]] && (( new_used >= limit )); then
+            _qset "$u" blocked "1"
+            _qset "$u" block_reason "quota"
+            _block_user "$u" "$port"
+            warn "[$u] quota exceeded: $(_fmt_bytes "$new_used") / $(_fmt_bytes "$limit") — blocked"
+        fi
+    done
+}
+
+_quota_install_cmd() {
+    local script_path
+    script_path=$(realpath "${BASH_SOURCE[0]}")
+
+    cat > /etc/systemd/system/snell-quota.service << EOF
+[Unit]
+Description=Snell quota sync (one-shot)
+
+[Service]
+Type=oneshot
+ExecStart=$script_path quota sync
+EOF
+
+    cat > /etc/systemd/system/snell-quota.timer << 'EOF'
+[Unit]
+Description=Snell quota sync every 60 s
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=60s
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now snell-quota.timer
+    ok "snell-quota.timer installed — syncs every 60 seconds"
 }
 
 # ── usage / dispatch ──────────────────────────────────────────────────────────
@@ -326,6 +757,14 @@ API commands:
   keygen               Generate (or rotate) URL prefix + Bearer token
   keyshow              Print current prefix, token, and access URLs
   api-install          Install Python deps and start snell-api systemd service
+
+Quota commands:
+  quota set <u> <sz>   Set traffic quota (e.g. 100GB 50G 1TB 512MB)
+  quota show [user]    Show usage table
+  quota reset <user>   Reset counter and unblock user
+  quota rm <user>      Remove quota for user
+  quota sync           Manually sync iptables counters
+  quota install        Install systemd timer (auto-sync every 60 s)
 EOF
 }
 
@@ -341,5 +780,6 @@ case "${1:-}" in
     keygen)      cmd_keygen ;;
     keyshow)     cmd_keyshow ;;
     api-install) cmd_api_install ;;
+    quota)       cmd_quota   "$@" ;;
     *)           usage ;;
 esac

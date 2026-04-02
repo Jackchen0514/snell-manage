@@ -351,6 +351,234 @@ def surge_one(username: str, _token: str = Depends(verify_token)):
         line=f"{username} = snell, {ip}, {d['port']}, psk={d['psk']}, version=5",
     )
 
+# ── /quota ────────────────────────────────────────────────────────────────────
+
+QUOTA_DIR = Path("/etc/snell/quota")
+
+def _qget(username: str, key: str, default: int = 0) -> int:
+    f = QUOTA_DIR / username
+    if not f.exists():
+        return default
+    for line in f.read_text().splitlines():
+        if line.startswith(f"{key}="):
+            try:
+                return int(line.split("=", 1)[1])
+            except ValueError:
+                return default
+    return default
+
+def _qset(username: str, key: str, value: int):
+    f = QUOTA_DIR / username
+    if not f.exists():
+        return
+    lines = f.read_text().splitlines()
+    new_lines = []
+    updated = False
+    for line in lines:
+        if line.startswith(f"{key}="):
+            new_lines.append(f"{key}={value}")
+            updated = True
+        else:
+            new_lines.append(line)
+    if not updated:
+        new_lines.append(f"{key}={value}")
+    f.write_text("\n".join(new_lines) + "\n")
+
+def _parse_size(s: str) -> int:
+    s = s.upper().rstrip("B")
+    units = {"T": 1099511627776, "G": 1073741824, "M": 1048576, "K": 1024}
+    if s and s[-1] in units:
+        num, unit = s[:-1], s[-1]
+    else:
+        num, unit = s, ""
+    if not num.isdigit():
+        raise HTTPException(400, detail=f"Invalid size '{s}'. Examples: 100GB, 50G, 1TB, 512MB")
+    n = int(num)
+    return n * units.get(unit, 1)
+
+def _fmt_bytes(b: int) -> str:
+    if b >= 1099511627776: return f"{b/1099511627776:.2f} TB"
+    if b >= 1073741824:    return f"{b/1073741824:.2f} GB"
+    if b >= 1048576:       return f"{b/1048576:.2f} MB"
+    if b >= 1024:          return f"{b/1024:.2f} KB"
+    return f"{b} B"
+
+class QuotaOut(BaseModel):
+    username:        str
+    limit:           int
+    limit_fmt:       str
+    used:            int
+    used_fmt:        str
+    remain:          int
+    remain_fmt:      str
+    percent:         float
+    blocked:         bool
+    period:          str   # subscription plan: monthly / quarterly / yearly
+    next_reset:      int   # unix timestamp of next monthly traffic reset
+    next_reset_date: str   # YYYY-MM-DD or "—"
+
+class SetQuotaIn(BaseModel):
+    limit: str   # e.g. "100GB" — monthly traffic allowance
+    plan: str    # monthly / quarterly / yearly — subscription duration
+
+class RenewIn(BaseModel):
+    plan: Optional[str] = None  # keep current plan if omitted
+
+def _qget_str(username: str, key: str, default: str = "") -> str:
+    f = QUOTA_DIR / username
+    if not f.exists():
+        return default
+    for line in f.read_text().splitlines():
+        if line.startswith(f"{key}="):
+            return line.split("=", 1)[1]
+    return default
+
+def _fmt_date(ts: int) -> str:
+    if ts <= 0:
+        return "—"
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+
+def _quota_info(username: str) -> QuotaOut:
+    limit        = _qget(username, "limit")
+    used         = _qget(username, "used")
+    blocked      = bool(_qget(username, "blocked"))
+    block_reason = _qget_str(username, "block_reason", "")
+    plan         = _qget_str(username, "plan", "—")
+    expire       = _qget(username, "expire", 0)
+    next_reset   = _qget(username, "next_reset", 0)
+    remain       = max(limit - used, 0)
+    pct          = round(used / limit * 100, 1) if limit > 0 else 0.0
+    return QuotaOut(
+        username=username,
+        limit=limit,       limit_fmt=_fmt_bytes(limit),
+        used=used,         used_fmt=_fmt_bytes(used),
+        remain=remain,     remain_fmt=_fmt_bytes(remain),
+        percent=pct,
+        blocked=blocked,
+        period=plan,
+        next_reset=next_reset,
+        next_reset_date=_fmt_date(next_reset),
+    )
+
+
+@router.get(
+    "/quota",
+    response_model=List[QuotaOut],
+    summary="List quota for all users",
+    tags=["Quota"],
+)
+def quota_list(_token: str = Depends(verify_token)):
+    result = []
+    for f in sorted(QUOTA_DIR.glob("*")):
+        if f.is_file():
+            result.append(_quota_info(f.name))
+    return result
+
+
+@router.get(
+    "/quota/{username}",
+    response_model=QuotaOut,
+    summary="Get quota for one user",
+    tags=["Quota"],
+)
+def quota_get(username: str, _token: str = Depends(verify_token)):
+    _validate_username(username)
+    if not (QUOTA_DIR / username).exists():
+        raise HTTPException(404, detail=f"No quota set for '{username}'")
+    return _quota_info(username)
+
+
+@router.post(
+    "/quota/{username}",
+    response_model=QuotaOut,
+    status_code=201,
+    summary="Set quota for a user",
+    description="Creates or updates the traffic quota. Accepts sizes like `100GB`, `50G`, `1TB`, `512MB`.",
+    tags=["Quota"],
+)
+def quota_set(username: str, body: SetQuotaIn, _token: str = Depends(verify_token)):
+    _validate_username(username)
+    if not (CONFIG_DIR / f"{username}.conf").exists():
+        raise HTTPException(404, detail=f"User '{username}' not found")
+
+    limit = _parse_size(body.limit)
+    QUOTA_DIR.mkdir(parents=True, exist_ok=True)
+    f = QUOTA_DIR / username
+    if not f.exists():
+        f.write_text(f"limit={limit}\nused=0\nblocked=0\nlast_in=0\nlast_out=0\n")
+    else:
+        _qset(username, "limit", limit)
+
+    if body.plan not in ("monthly", "quarterly", "yearly"):
+        raise HTTPException(400, detail="plan must be: monthly, quarterly, yearly")
+    subprocess.run(
+        ["/usr/local/bin/snell-manage", "quota", "set", username, body.limit, body.plan],
+        capture_output=True,
+    )
+
+    return _quota_info(username)
+
+
+@router.delete(
+    "/quota/{username}",
+    status_code=204,
+    summary="Remove quota for a user",
+    tags=["Quota"],
+)
+def quota_delete(username: str, _token: str = Depends(verify_token)):
+    _validate_username(username)
+    if not (QUOTA_DIR / username).exists():
+        raise HTTPException(404, detail=f"No quota set for '{username}'")
+    subprocess.run(
+        ["/usr/local/bin/snell-manage", "quota", "rm", username],
+        capture_output=True,
+    )
+
+
+@router.post(
+    "/quota/{username}/reset",
+    response_model=QuotaOut,
+    summary="Reset usage counter and unblock user",
+    tags=["Quota"],
+)
+def quota_reset(username: str, _token: str = Depends(verify_token)):
+    _validate_username(username)
+    if not (QUOTA_DIR / username).exists():
+        raise HTTPException(404, detail=f"No quota set for '{username}'")
+    try:
+        _run(["/usr/local/bin/snell-manage", "quota", "reset", username])
+    except RuntimeError as e:
+        raise HTTPException(500, detail=str(e))
+    return _quota_info(username)
+
+
+@router.post(
+    "/quota/{username}/renew",
+    response_model=QuotaOut,
+    summary="Renew subscription",
+    description=(
+        "Extends the account expiry by one plan period. "
+        "Pass `plan` to switch plans; omit to keep the current one. "
+        "If already expired, extends from now; otherwise extends from the current expiry."
+    ),
+    tags=["Quota"],
+)
+def quota_renew(username: str, body: RenewIn, _token: str = Depends(verify_token)):
+    _validate_username(username)
+    if not (QUOTA_DIR / username).exists():
+        raise HTTPException(404, detail=f"No quota set for '{username}'")
+    if body.plan and body.plan not in ("monthly", "quarterly", "yearly"):
+        raise HTTPException(400, detail="plan must be: monthly, quarterly, yearly")
+    args = ["/usr/local/bin/snell-manage", "quota", "renew", username]
+    if body.plan:
+        args.append(body.plan)
+    try:
+        _run(args)
+    except RuntimeError as e:
+        raise HTTPException(500, detail=str(e))
+    return _quota_info(username)
+
 # ── Mount router ──────────────────────────────────────────────────────────────
 
 app.include_router(router)
