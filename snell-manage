@@ -641,12 +641,12 @@ _quota_sync_cmd() {
 
     # ── 0. Remove iptables rules for deleted users ────────────────────────────
     while IFS= read -r line; do
-        local comment port_num direction user_tag
-        comment=$(echo "$line" | grep -oP '\/\* snell-(in|out):\K[^ *]+')
+        local comment port_num direction
+        comment=$(echo "$line" | grep -oP '\/\* snell-(in|out):\K[^ *]+' || true)
         [[ -z "$comment" ]] && continue
         if [[ ! -f "$CONFIG_DIR/$comment.conf" ]]; then
-            port_num=$(echo "$line" | grep -oP 'dpt:\K[0-9]+|spt:\K[0-9]+' | head -1)
-            direction=$(echo "$line" | grep -oP 'snell-\K(in|out)(?=:)')
+            port_num=$(echo "$line" | grep -oP 'dpt:\K[0-9]+|spt:\K[0-9]+' | head -1 || true)
+            direction=$(echo "$line" | grep -oP 'snell-\K(in|out)(?=:)' || true)
             [[ -z "$port_num" ]] && continue
             if [[ "$direction" == "in" ]]; then
                 iptables -D SNELL_ACCT -p tcp --dport "$port_num" -m comment --comment "snell-in:$comment"  -j RETURN 2>/dev/null || true
