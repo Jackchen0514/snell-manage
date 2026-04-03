@@ -142,8 +142,13 @@ cmd_delete() {
     [[ -n "$username" ]] || die "Usage: snell-manage delete <username>"
     [[ -f "$CONFIG_DIR/$username.conf" ]] || die "User '$username' does not exist"
 
+    local port
+    port=$(_user_port "$username" 2>/dev/null || true)
+
     systemctl disable --now "snell@$username" 2>/dev/null || true
+    [[ -n "$port" ]] && _acct_rm "$username" "$port" 2>/dev/null || true
     rm -f "$CONFIG_DIR/$username.conf"
+    rm -f "$QUOTA_DIR/$username"
     ok "User '$username' deleted"
 }
 
