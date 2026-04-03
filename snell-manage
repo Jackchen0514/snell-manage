@@ -2,7 +2,14 @@
 
 set -euo pipefail
 
-BINARY_URL="https://dl.nssurge.com/snell/snell-server-v5.0.1-linux-amd64.zip"
+_detect_arch() {
+    case "$(uname -m)" in
+        x86_64)          echo "amd64" ;;
+        aarch64|arm64)   echo "aarch64" ;;
+        *)               die "Unsupported architecture: $(uname -m)" ;;
+    esac
+}
+BINARY_URL="https://dl.nssurge.com/snell/snell-server-v5.0.1-linux-$(_detect_arch).zip"
 BINARY_PATH="/usr/local/bin/snell-server"
 CONFIG_DIR="/etc/snell/users"
 SERVICE_TEMPLATE="/etc/systemd/system/snell@.service"
