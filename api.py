@@ -238,7 +238,7 @@ def add_user(body: AddUserIn, _token: str = Depends(verify_token)):
     if conf_path.exists():
         raise HTTPException(409, detail=f"User '{body.username}' already exists")
     if not BINARY_PATH.exists():
-        raise HTTPException(503, detail="snell-server not installed. Call POST /install first.")
+        install(_token)
 
     port = body.port or _next_port()
 
