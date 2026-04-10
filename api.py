@@ -419,7 +419,10 @@ class QuotaOut(BaseModel):
     remain_fmt:      str
     percent:         float
     blocked:         bool
+    block_reason:    Optional[str]
     period:          str   # subscription plan: monthly / quarterly / yearly
+    expire:          int   # unix timestamp of account expiry
+    expire_date:     str   # YYYY-MM-DD or "—"
     next_reset:      int   # unix timestamp of next monthly traffic reset
     next_reset_date: str   # YYYY-MM-DD or "—"
 
@@ -462,7 +465,10 @@ def _quota_info(username: str) -> QuotaOut:
         remain=remain,     remain_fmt=_fmt_bytes(remain),
         percent=pct,
         blocked=blocked,
+        block_reason=block_reason or None,
         period=plan,
+        expire=expire,
+        expire_date=_fmt_date(expire),
         next_reset=next_reset,
         next_reset_date=_fmt_date(next_reset),
     )

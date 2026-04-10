@@ -527,10 +527,12 @@ _quota_renew_cmd() {
     current_expire=$(_qget "$username" expire)
     (( current_expire > now )) && base=$current_expire || base=$now
 
+    local base_date
+    base_date=$(date -d "@${base}" "+%Y-%m-%d %H:%M:%S")
     case "$plan" in
-        monthly)   new_expire=$(date -d "@${base} +1 month"  +%s) ;;
-        quarterly) new_expire=$(date -d "@${base} +3 months" +%s) ;;
-        yearly)    new_expire=$(date -d "@${base} +1 year"   +%s) ;;
+        monthly)   new_expire=$(date -d "$base_date +1 month"  +%s) ;;
+        quarterly) new_expire=$(date -d "$base_date +3 months" +%s) ;;
+        yearly)    new_expire=$(date -d "$base_date +1 year"   +%s) ;;
     esac
 
     _qset "$username" plan   "$plan"
