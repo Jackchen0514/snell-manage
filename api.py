@@ -114,9 +114,15 @@ def _next_port() -> int:
         if d["port"]:
             used.add(d["port"])
     p = PORT_START
-    while p in used:
+    while True:
+        if p not in used:
+            r = subprocess.run(
+                ["ss", "-tlnH", f"sport = :{p}"],
+                capture_output=True, text=True,
+            )
+            if not r.stdout.strip():
+                return p
         p += 1
-    return p
 
 def _server_ip() -> str:
     try:

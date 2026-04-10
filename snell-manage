@@ -36,6 +36,9 @@ next_port() {
         for conf in "${confs[@]}"; do
             grep -q "listen = 0.0.0.0:$port" "$conf" && in_use=true && break
         done
+        if ! $in_use; then
+            ss -tlnH "sport = :$port" 2>/dev/null | grep -q . && in_use=true
+        fi
         $in_use || { echo "$port"; return; }
         ((port++))
     done
